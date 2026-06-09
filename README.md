@@ -33,4 +33,19 @@ V5 возвращает систему к задуманному образу.
 
 ## Статус
 
-Фаза 0 — скелет + порт инфраструктуры. См. `docs/PLAN.md`.
+- **Фаза 0** ✅ скелет + порт инфраструктуры (1:1 проверено).
+- **Фаза 1** ✅ детектор: канал/spark/twix/баллы + нисходящий→боковик (усиленный сигнал).
+- **Фаза 2** ✅ вход (закреп телом)/выход (VAH+трейлинг)/стопы/гейт 3:1 + маршрут сингл-vs-мартингейл по ширине канала (решено по данным).
+- **Фаза 3** ✅ 5 Telegram-уведомлений, CLI (`universe/cache/backtest/scan`), Streamlit UI (бэктест + IRL).
+
+32 теста зелёные. См. `docs/PLAN.md`, `docs/T2.4_routing_decision.md`.
+
+## Запуск
+
+```bash
+python -m app.main universe                                  # spot+futures (futures-priority)
+python -m app.main cache --start 2024-01-01 --end 2025-12-31 # кэш свечей
+python -m app.main backtest --cache-root <path> --limit 100  # бэктест -> trades.parquet
+python -m app.main scan --cache-root <path>                  # IRL скан + уведомления
+streamlit run app/ui/streamlit_app.py -- --cache-root <path> # UI
+```
