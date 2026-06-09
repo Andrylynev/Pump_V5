@@ -22,7 +22,14 @@ import yaml
 CFG = yaml.safe_load(open("/root/Pump_V5/app/config/default.yaml"))
 DET = MethodicDetector(detector_cfg=CFG["detector"])
 NEAR_PCT = 0.03          # within 3% of upper bound = "near"
-FRESH_DAYS = 10          # accumulation must end within N days of latest bar
+FRESH_DAYS = 75          # keep formations still active now. The detector finds the
+                         # tightest historical sub-window, so a CURRENTLY-valid
+                         # channel can have accumulation_end up to ~2.5mo back while
+                         # price is still inside it (cross-check vs manual scan caught
+                         # RLUSDUSDT/POL/LTC being dropped at the old 10d cutoff).
+                         # We additionally require price is still inside/at the channel
+                         # (not collapsed far below the lower bound) — see filter below.
+MAX_BELOW_LOWER = 0.15   # drop if last close fell >15% under the lower bound (channel dead)
 MIN_BARS = CFG["detector"]["min_range_days"]
 NOW_MS = int(time.time() * 1000)
 LOOKBACK_DAYS = 400
@@ -94,6 +101,9 @@ def scan():
             if age_days > FRESH_DAYS:
                 continue  # stale formation, not current
             ub = float(f.upper_bound); lb = float(f.lower_bound)
+            # Channel must still be alive: price not collapsed far below the floor.
+            if lb > 0 and last_close < lb * (1 - MAX_BELOW_LOWER):
+                continue
             if last_close > ub:
                 state = "broke_out"
             elif last_close >= ub * (1 - NEAR_PCT):
