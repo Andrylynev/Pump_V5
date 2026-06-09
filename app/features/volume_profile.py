@@ -55,31 +55,33 @@ def calculate_fixed_range_volume_profile(
     edges = np.linspace(price_min, price_max, bins_count + 1)
     mids = (edges[:-1] + edges[1:]) / 2
 
+    # Vectorized proportional allocation: for every candle, distribute its volume
+    # across bins by the fraction of the candle's [low, high] range overlapping
+    # each bin. Identical semantics to the per-candle/per-bin loop, but O(1) Python.
+    low = data["low"].to_numpy(dtype=float)
+    high = data["high"].to_numpy(dtype=float)
+    vol = data["volume"].to_numpy(dtype=float)
+    is_up = (data["close"].to_numpy(dtype=float) >= data["open"].to_numpy(dtype=float))
+
+    valid = (high > low) & (vol > 0)
+    low, high, vol, is_up = low[valid], high[valid], vol[valid], is_up[valid]
+
     total_volume = np.zeros(bins_count, dtype=float)
     up_volume = np.zeros(bins_count, dtype=float)
     down_volume = np.zeros(bins_count, dtype=float)
 
-    for _, candle in data.iterrows():
-        low = float(candle["low"])
-        high = float(candle["high"])
-        volume = float(candle["volume"])
-        if high <= low or volume <= 0:
-            continue
-        candle_is_up = float(candle["close"]) >= float(candle["open"])
-        candle_range = max(high - low, EPS)
-
-        for i in range(bins_count):
-            bin_low = edges[i]
-            bin_high = edges[i + 1]
-            overlap = max(0.0, min(high, bin_high) - max(low, bin_low))
-            if overlap <= 0:
-                continue
-            allocated = volume * (overlap / candle_range)
-            total_volume[i] += allocated
-            if candle_is_up:
-                up_volume[i] += allocated
-            else:
-                down_volume[i] += allocated
+    if len(low) > 0:
+        bin_low = edges[:-1][None, :]   # (1, bins)
+        bin_high = edges[1:][None, :]   # (1, bins)
+        c_low = low[:, None]            # (candles, 1)
+        c_high = high[:, None]
+        c_range = np.maximum(c_high - c_low, EPS)
+        overlap = np.maximum(0.0, np.minimum(c_high, bin_high) - np.maximum(c_low, bin_low))
+        alloc = (vol[:, None]) * (overlap / c_range)  # (candles, bins)
+        total_volume = alloc.sum(axis=0)
+        up_mask = is_up[:, None]
+        up_volume = np.where(up_mask, alloc, 0.0).sum(axis=0)
+        down_volume = np.where(~up_mask, alloc, 0.0).sum(axis=0)
 
     total = float(total_volume.sum())
     if total <= EPS:
