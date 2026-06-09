@@ -41,6 +41,23 @@ class BacktestPipeline:
     cfg: dict[str, Any]
     cache_root: str
 
+    def _prior_high_time(self, daily: pd.DataFrame, acc_start: Any, lookback_days: int = 120):
+        """Timestamp of the swing HIGH just before accumulation began.
+
+        The fixed-range VP must start here (per TZ) so its upper zone (VAH) lands
+        ABOVE the breakout — the span includes the higher-priced bars of the
+        decline into the range. Falls back to acc_start if no prior bars.
+        """
+        ts = pd.to_datetime(daily["timestamp"], utc=True)
+        a0 = pd.Timestamp(acc_start)
+        a0 = a0.tz_localize("UTC") if a0.tzinfo is None else a0.tz_convert("UTC")
+        prior = daily[ts < a0]
+        if prior.empty:
+            return acc_start
+        prior = prior.tail(lookback_days)
+        idx = prior["high"].astype(float).idxmax()
+        return pd.Timestamp(prior.loc[idx, "timestamp"]).to_pydatetime()
+
     def run_symbol(self, symbol: str) -> list[dict[str, Any]]:
         det = MethodicDetector(detector_cfg=self.cfg["detector"])
         ev = EntryEvaluator(entry_cfg=self.cfg["entry"])
@@ -70,10 +87,15 @@ class BacktestPipeline:
             entry_price = float(decision["entry_price"])
             entry_time = decision["entry_time"]
 
-            # Pump target = VAH from prior-high (window start) -> entry time.
-            prior_high_time = f.accumulation_start
+            # Pump target (длина пампа): fixed-range VP from the PRIOR HIGH (the
+            # swing high BEFORE accumulation began) to current. Its upper volume
+            # zone (VAH) is the target — it sits above the breakout because the
+            # span includes the higher-priced decline into the range. (TZ: «от
+            # предыдущего хая до начала накопления … до текущей».)
+            prior_high_time = self._prior_high_time(daily, f.accumulation_start)
             tgt = compute_pump_target(daily, prior_high_time, entry_time, vp_cfg)
-            vah = tgt.vah if tgt.ok and tgt.vah > entry_price else entry_price * 1.5
+            # VAH is the target only if it sits above entry; else fall back.
+            vah = tgt.vah if (tgt.ok and tgt.vah > entry_price) else entry_price * 1.5
 
             # Resolve entry index in intraday for the swing-low stop + exit walk.
             idf = intraday.sort_values("timestamp").reset_index(drop=True)
