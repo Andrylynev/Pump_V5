@@ -49,6 +49,7 @@ detector:
   min_accumulation_score: 3.0    # manipulation likely at >= 3 points
   # downtrend->sideways formations are a stronger signal
   downtrend_to_range_bonus: true
+  downtrend_lookback_days: 30
 
 # ── ENTRY (method canon) ──
 entry:

@@ -234,7 +234,23 @@ class MethodicDetector:
             "twix_cum": np.concatenate([[0], np.cumsum(is_twix)]),
         }
 
-    def _window_metrics(self, w: pd.DataFrame, marks: dict[str, np.ndarray], start_idx: int, end_idx: int) -> dict[str, Any]:
+    def _preceding_downtrend(self, df: pd.DataFrame, start_idx: int, lookback: int = 30) -> bool:
+        """Was the run immediately BEFORE this window a downtrend?
+
+        Per TZ: a sideways formation that broke a prior downtrend is a NEW, and
+        STRONGER, formation (the operator who accumulated through the downtrend
+        AND the range must push price higher to profit).
+        """
+        pre_start = max(0, start_idx - lookback)
+        if start_idx - pre_start < 5:
+            return False
+        pre = df.iloc[pre_start:start_idx]
+        if len(pre) < 5:
+            return False
+        ch = build_channel(pre, downtrend_slope_threshold=float(self.detector_cfg.get("downtrend_slope_threshold", -0.0005)))
+        return ch.trend == "downtrend"
+
+    def _window_metrics(self, w: pd.DataFrame, marks: dict[str, np.ndarray], start_idx: int, end_idx: int, df: pd.DataFrame | None = None) -> dict[str, Any]:
         cfg = self.detector_cfg
         spark_weight = float(cfg.get("spark_weight", 1.0))
         twix_weight = float(cfg.get("twix_weight", 0.5))
@@ -249,6 +265,12 @@ class MethodicDetector:
         twix_count = int(marks["twix_cum"][end_idx + 1] - marks["twix_cum"][start_idx])
         score = spark_count * spark_weight + twix_count * twix_weight
 
+        # Stronger-signal case: sideways range that broke a prior downtrend.
+        downtrend_to_range = False
+        if df is not None and channel.trend == "sideways" and bool(cfg.get("downtrend_to_range_bonus", True)):
+            lookback = int(cfg.get("downtrend_lookback_days", 30))
+            downtrend_to_range = self._preceding_downtrend(df, start_idx, lookback)
+
         prior_high = float(w["high"].iloc[0])
 
         return {
@@ -260,6 +282,7 @@ class MethodicDetector:
             "spark_count": spark_count,
             "twix_count": twix_count,
             "accumulation_score": float(score),
+            "downtrend_to_range": bool(downtrend_to_range),
             "prior_high": prior_high,
             "n_bars": int(len(w)),
         }
@@ -296,7 +319,7 @@ class MethodicDetector:
                 if sc < min_score:
                     continue
                 w = df.iloc[start_idx : end_idx + 1]
-                m = self._window_metrics(w, marks, start_idx, end_idx)
+                m = self._window_metrics(w, marks, start_idx, end_idx, df=df)
 
                 # Range constraint: up to ~50% (channel_width <= max_width).
                 if m["channel_width"] > max_width:
@@ -333,8 +356,16 @@ class MethodicDetector:
         if not raw:
             return []
 
-        # Prefer higher score, then narrower channel (stronger pump per TZ).
-        raw.sort(key=lambda c: (c.score, -c.channel_width), reverse=True)
+        # Rank: downtrend->range formations first (stronger signal per TZ), then
+        # higher score, then narrower channel (strongest pumps from narrow channels).
+        raw.sort(
+            key=lambda c: (
+                1 if c.diagnostics.get("downtrend_to_range") else 0,
+                c.score,
+                -c.channel_width,
+            ),
+            reverse=True,
+        )
         selected: list[FormationCandidate] = []
         for cand in raw:
             overlap = False
