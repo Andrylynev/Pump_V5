@@ -101,6 +101,15 @@ class ExitConfig:
     trailing_atr_adaptive: bool = True
     stop_single: str = "prev_channel_low"
     stop_martingale: str = "channel_break_down"
+    # Exit policy: how we balance the tight trail vs running to the VAH target.
+    #   "trailing"     -> single trailing stop (baseline; profit lives on trail)
+    #   "partial_vah"  -> book `partial_fraction` of the position on the trailing
+    #                     stop, ride the remainder to VAH (or its own wider trail)
+    #   (ATR-adaptive trail is orthogonal: set trailing_atr_adaptive=True and the
+    #    pipeline passes an ATR-derived distance per symbol.)
+    policy: str = "trailing"
+    partial_fraction: float = 0.5          # fraction booked on the first trail hit
+    runner_trail_pct: float = 0.15         # wider trail for the VAH runner leg
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any]) -> "ExitConfig":
@@ -113,6 +122,9 @@ class ExitConfig:
             trailing_atr_adaptive=bool(tr.get("atr_adaptive", True)),
             stop_single=str(cfg.get("stop_single", "prev_channel_low")),
             stop_martingale=str(cfg.get("stop_martingale", "channel_break_down")),
+            policy=str(cfg.get("policy", "trailing")),
+            partial_fraction=float(cfg.get("partial_fraction", 0.5)),
+            runner_trail_pct=float(cfg.get("runner_trail_pct", 0.15)),
         )
 
 
@@ -144,6 +156,12 @@ def simulate_exit(
     high_since = entry_price
     trail_price = 0.0
     trailing_active = False
+    # partial_vah policy state
+    booked = 0.0           # PnL fraction already realized on the partial leg
+    booked_frac = 0.0      # position fraction already closed
+    partial_booked = False
+    runner_trail = 0.0
+    runner_done = False
 
     h = pd.to_numeric(df["high"], errors="coerce").to_numpy()
     l = pd.to_numeric(df["low"], errors="coerce").to_numpy()
@@ -153,48 +171,62 @@ def simulate_exit(
     for i in range(entry_idx + 1, n):
         high_since = max(high_since, float(h[i]))
 
-        # 1. Hard stop / channel-break-down.
+        # 1. Hard stop / channel-break-down. (applies to full remaining size)
         eff_stop = stop_price if mode == "single" else channel_lower
         if eff_stop > 0 and l[i] <= eff_stop:
-            return {
-                "outcome": "stop_loss" if mode == "single" else "channel_break_down",
-                "exit_price": float(eff_stop),
-                "exit_time": pd.Timestamp(tcol.iloc[i]).to_pydatetime(),
-                "exit_idx": int(i),
-                "pnl_pct": (float(eff_stop) - entry_price) / max(entry_price, EPS),
-            }
+            return _finish(
+                booked, booked_frac, eff_stop, entry_price,
+                "stop_loss" if mode == "single" else "channel_break_down",
+                tcol, i,
+            )
 
-        # 2. Trailing stop.
-        if exit_cfg.trailing_enabled:
+        # 2. Trailing stop (owns the position until a partial is booked).
+        if exit_cfg.trailing_enabled and not partial_booked:
             if not trailing_active and high_since >= entry_price * (1.0 + dist):
                 trailing_active = True
             if trailing_active:
                 trail_price = max(trail_price, high_since * (1.0 - dist))
                 if l[i] <= trail_price:
-                    return {
-                        "outcome": "trailing_stop",
-                        "exit_price": float(trail_price),
-                        "exit_time": pd.Timestamp(tcol.iloc[i]).to_pydatetime(),
-                        "exit_idx": int(i),
-                        "pnl_pct": (float(trail_price) - entry_price) / max(entry_price, EPS),
-                    }
+                    if exit_cfg.policy == "partial_vah" and not partial_booked:
+                        # Book `partial_fraction` here; ride the remainder to VAH
+                        # under a wider runner trail. The runner re-arms from the
+                        # current high so it doesn't insta-stop on this same bar.
+                        pf = max(0.0, min(1.0, exit_cfg.partial_fraction))
+                        booked += pf * (float(trail_price) - entry_price) / max(entry_price, EPS)
+                        booked_frac += pf
+                        partial_booked = True
+                        rdist = max(exit_cfg.runner_trail_pct, dist)
+                        runner_trail = high_since * (1.0 - rdist)
+                        continue
+                    return _finish(booked, booked_frac, trail_price, entry_price,
+                                   "trailing_stop", tcol, i)
+
+        # 2b. Runner leg (partial_vah only): wider trail on the remainder.
+        if partial_booked and not runner_done:
+            runner_trail = max(runner_trail, high_since * (1.0 - max(exit_cfg.runner_trail_pct, dist)))
+            if l[i] <= runner_trail:
+                return _finish(booked, booked_frac, runner_trail, entry_price,
+                               "partial_then_trail", tcol, i)
 
         # 3. VAH target.
         if exit_cfg.exit_at_target and target_vah > 0 and h[i] >= target_vah:
-            return {
-                "outcome": "target_vah",
-                "exit_price": float(target_vah),
-                "exit_time": pd.Timestamp(tcol.iloc[i]).to_pydatetime(),
-                "exit_idx": int(i),
-                "pnl_pct": (float(target_vah) - entry_price) / max(entry_price, EPS),
-            }
+            outcome = "partial_then_vah" if partial_booked else "target_vah"
+            return _finish(booked, booked_frac, target_vah, entry_price, outcome, tcol, i)
 
-    # Fallback: market close at last bar.
+    # Fallback: market close at last bar (remaining size).
     last = n - 1
+    outcome = "partial_then_close" if partial_booked else "market_close"
+    return _finish(booked, booked_frac, float(c[last]), entry_price, outcome, tcol, last)
+
+
+def _finish(booked, booked_frac, exit_price, entry_price, outcome, tcol, i):
+    """Blend already-booked partial PnL with the remaining-size exit."""
+    rem = max(0.0, 1.0 - booked_frac)
+    leg = rem * (float(exit_price) - entry_price) / max(entry_price, EPS)
     return {
-        "outcome": "market_close",
-        "exit_price": float(c[last]),
-        "exit_time": pd.Timestamp(tcol.iloc[last]).to_pydatetime(),
-        "exit_idx": int(last),
-        "pnl_pct": (float(c[last]) - entry_price) / max(entry_price, EPS),
+        "outcome": outcome,
+        "exit_price": float(exit_price),
+        "exit_time": pd.Timestamp(tcol.iloc[i]).to_pydatetime(),
+        "exit_idx": int(i),
+        "pnl_pct": float(booked + leg),
     }

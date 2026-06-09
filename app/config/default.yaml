@@ -66,10 +66,17 @@ exit:
   # pump target = upper volume zone (VAH) of fixed-range VP: prior-high -> current
   target_mode: vah
   exit_at_target: true                 # if VAH reached, exit
+  # exit policy: "trailing" (baseline) | "partial_vah" (book part on trail, ride rest to VAH)
+  policy: trailing
+  partial_fraction: 0.5                # fraction booked on first trail hit (partial_vah)
+  runner_trail_pct: 0.15               # wider trail for the VAH runner leg (partial_vah)
   trailing:
     enabled: true
     distance_pct: 0.05                 # ~5% start; tune by ATR / normal move
-    atr_adaptive: true
+    atr_adaptive: false                # true -> per-symbol trail = atr_mult x ATR%
+    atr_mult: 1.5
+    atr_floor_pct: 0.03
+    atr_cap_pct: 0.15
   stop_single: prev_channel_low        # single-entry stop = pre-rise swing low
   swing_low_lookback_bars: 30          # lookback for the pre-rise swing low (intraday bars)
   stop_martingale: channel_break_down  # martingale stop = price exits channel downward

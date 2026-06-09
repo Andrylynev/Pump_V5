@@ -58,6 +58,28 @@ class BacktestPipeline:
         idx = prior["high"].astype(float).idxmax()
         return pd.Timestamp(prior.loc[idx, "timestamp"]).to_pydatetime()
 
+    def _atr_trail_pct(self, daily: pd.DataFrame, acc_start: Any, current_time: Any,
+                       mult: float = 1.5, floor: float = 0.03, cap: float = 0.15) -> float:
+        """Trailing distance from the coin's normal move = mult x ATR% over the
+        accumulation window. Clamped to [floor, cap] so a single wild bar can't
+        produce an absurd trail. ATR% = mean(true_range / close)."""
+        ts = pd.to_datetime(daily["timestamp"], utc=True)
+        a0 = pd.Timestamp(acc_start); a0 = a0.tz_localize("UTC") if a0.tzinfo is None else a0.tz_convert("UTC")
+        c1 = pd.Timestamp(current_time); c1 = c1.tz_localize("UTC") if c1.tzinfo is None else c1.tz_convert("UTC")
+        win = daily[(ts >= a0) & (ts <= c1)]
+        if len(win) < 3:
+            return max(floor, min(cap, 0.05))
+        hi = win["high"].astype(float).to_numpy()
+        lo = win["low"].astype(float).to_numpy()
+        cl = win["close"].astype(float).to_numpy()
+        prev_c = pd.Series(cl).shift(1).to_numpy()
+        import numpy as np
+        tr = np.maximum.reduce([hi - lo, np.abs(hi - prev_c), np.abs(lo - prev_c)])
+        tr = tr[1:]  # drop first (no prev close)
+        clv = cl[1:]
+        atr_pct = float(np.nanmean(tr / np.where(clv == 0, np.nan, clv)))
+        return max(floor, min(cap, mult * atr_pct))
+
     def run_symbol(self, symbol: str) -> list[dict[str, Any]]:
         det = MethodicDetector(detector_cfg=self.cfg["detector"])
         ev = EntryEvaluator(entry_cfg=self.cfg["entry"])
@@ -132,10 +154,23 @@ class BacktestPipeline:
                 width_thr = float(route_cfg.get("martingale_when_width_above", 0.30))
                 mode = "martingale" if f.channel_width >= width_thr else "single"
 
+            # ATR-adaptive trailing distance (TZ: «5%… можно вычислить по ATR»).
+            # When enabled, derive the trail from the coin's normal daily move
+            # (ATR% over the accumulation), clamped to a sane band; else None ->
+            # exit_cfg's fixed distance.
+            atr_dist = None
+            if exit_cfg.trailing_atr_adaptive:
+                atr_dist = self._atr_trail_pct(
+                    daily, f.accumulation_start, entry_time,
+                    mult=float(self.cfg["exit"].get("trailing", {}).get("atr_mult", 1.5)),
+                    floor=float(self.cfg["exit"].get("trailing", {}).get("atr_floor_pct", 0.03)),
+                    cap=float(self.cfg["exit"].get("trailing", {}).get("atr_cap_pct", 0.15)),
+                )
+
             ex = simulate_exit(
                 idf, entry_idx=entry_idx, entry_price=entry_price,
                 target_vah=vah, stop_price=stop_single, channel_lower=float(f.lower_bound),
-                mode=mode, exit_cfg=exit_cfg,
+                mode=mode, exit_cfg=exit_cfg, trailing_distance_pct=atr_dist,
             )
             trades.append({
                 "symbol": symbol, "case_id": f.case_id, "entered": True,
