@@ -1,0 +1,8 @@
+httpx>=0.27,<1
+pandas>=2.2,<3
+numpy>=1.26,<2
+pyarrow>=14,<30
+PyYAML>=6,<7
+streamlit>=1.56,<2
+plotly>=6,<7
+pytest>=9,<10

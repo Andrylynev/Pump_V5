@@ -1,0 +1,110 @@
+project:
+  name: PumpV5
+  timezone: UTC
+
+api:
+  hosts:
+    - https://api.bybit.com
+    - https://api.bybit.kz
+  request_timeout_sec: 20
+  min_request_interval_sec: 0.25
+  max_retries_per_host: 3
+
+# Universe: track BOTH futures (linear) and spot; futures priority on overlap.
+universe:
+  quote_coin: USDT
+  status: Trading
+  linear_contract_type: LinearPerpetual
+  include_spot: true
+
+paths:
+  data_root: data
+  market_cache: data/cache/market
+  features_cache: data/cache/features
+  experiments_root: data/experiments/latest
+
+cache:
+  intervals:
+    - D       # accumulation / spark / twix scored on 1D
+    - "240"   # 4h breakout watch
+    - "60"    # 1h breakout watch
+
+# ── DETECTOR (method canon, ТЗ-решения 2026-06-09) ──
+detector:
+  min_range_days: 45          # accumulation must last >= 45 days
+  max_range_days: 180
+  scan_step_days: 3
+  # channel: range moves up to ~50% over the window
+  max_channel_width: 0.50     # high/low spread as fraction of low
+  # trend classification: sideways -> flat bounds, downtrend -> sloped bounds
+  downtrend_slope_threshold: -0.0005   # normalized close slope below this => downtrend
+  flat_bound_quantile: 0.0    # 0 => use absolute max-high / min-low for flat channel
+  # spark: green candle whose volume exceeds EACH of up-to-4 preceding reds individually
+  spark:
+    max_red_lookback: 4
+    small_body_max_ratio: 0.35   # body/range below this => "small body / low price impact"
+  spark_weight: 1.0
+  twix_weight: 0.5
+  min_accumulation_score: 3.0    # manipulation likely at >= 3 points
+  # downtrend->sideways formations are a stronger signal
+  downtrend_to_range_bonus: true
+
+# ── ENTRY (method canon) ──
+entry:
+  breakout_timeframes: ["240", "60"]   # watch 4h then 1h
+  require_body_close_above: true       # enter only after body closes above upper bound
+  skip_if_extended_pct: 0.10           # skip if price already flew >~10% past breakout
+  extended_pct_atr_adaptive: true      # adapt the 10% by ATR / normal move
+  initial_equity_usd: 10000
+  equity_fraction_per_trade: 0.10
+  min_risk_reward: 3.0                 # >= 3:1 (upside to VAH vs downside to stop)
+
+# ── EXIT (method canon) ──
+exit:
+  # pump target = upper volume zone (VAH) of fixed-range VP: prior-high -> current
+  target_mode: vah
+  exit_at_target: true                 # if VAH reached, exit
+  trailing:
+    enabled: true
+    distance_pct: 0.05                 # ~5% start; tune by ATR / normal move
+    atr_adaptive: true
+  stop_single: prev_channel_low        # single-entry stop = pre-rise channel low
+  stop_martingale: channel_break_down  # martingale stop = price exits channel downward
+
+# ── POSITION ROUTING (single vs martingale) ──
+# Criterion decided by data analysis (T9). Defaults are placeholders until
+# the analysis fixes the threshold with numbers.
+routing:
+  mode: auto                           # auto | single | martingale
+  martingale_when_score_below: 4.0     # weaker accumulation -> hedge with martingale
+  martingale:
+    grid_depth: 5
+    size_multiplier: 2.0
+    max_equity_fraction: 0.10
+    min_notional_usd: 5.0
+
+backtest:
+  start: "2024-01-01"
+  end: "2025-12-31"
+  max_symbols: 0
+
+volume_profile:
+  bins_count: 100
+  value_area_percent: 0.70
+  hvn_quantile: 0.80
+  lvn_quantile: 0.20
+
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_id: ""
+
+trading:
+  enabled: false
+  host: https://api-demo.bybit.com
+  api_key: ""
+  api_secret: ""
+
+irl:
+  max_symbols: 0
+  max_new_positions_per_run: 3
