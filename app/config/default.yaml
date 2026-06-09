@@ -69,15 +69,17 @@ exit:
     enabled: true
     distance_pct: 0.05                 # ~5% start; tune by ATR / normal move
     atr_adaptive: true
-  stop_single: prev_channel_low        # single-entry stop = pre-rise channel low
+  stop_single: prev_channel_low        # single-entry stop = pre-rise swing low
+  swing_low_lookback_bars: 30          # lookback for the pre-rise swing low (intraday bars)
   stop_martingale: channel_break_down  # martingale stop = price exits channel downward
 
 # ── POSITION ROUTING (single vs martingale) ──
-# Criterion decided by data analysis (T9). Defaults are placeholders until
-# the analysis fixes the threshold with numbers.
+# T2.4 decision (data-driven, 150 symbols / 41 trades): route by CHANNEL WIDTH,
+# not score. Narrow channel = high conviction = single; wide = hedge w/ martingale.
+# See docs/T2.4_routing_decision.md.
 routing:
   mode: auto                           # auto | single | martingale
-  martingale_when_score_below: 4.0     # weaker accumulation -> hedge with martingale
+  martingale_when_width_above: 0.30    # width >= this -> martingale (hedge wider risk)
   martingale:
     grid_depth: 5
     size_multiplier: 2.0

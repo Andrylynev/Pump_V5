@@ -67,6 +67,31 @@ def risk_reward(entry: float, target: float, stop: float) -> float:
     return upside / downside
 
 
+def find_prerise_swing_low(
+    intraday_df: pd.DataFrame,
+    entry_idx: int,
+    lookback_bars: int = 30,
+    channel_lower: float = 0.0,
+) -> float:
+    """The previous swing low before the breakout move (TZ single-entry stop).
+
+    NOT the absolute channel floor — the TZ says stop on the *previous low that
+    was before the rise*. We take the minimum low over a short lookback window
+    ending at the entry bar, floored at the channel lower bound for safety.
+    """
+    df = intraday_df.sort_values("timestamp").reset_index(drop=True)
+    lo = pd.to_numeric(df["low"], errors="coerce").to_numpy()
+    start = max(0, entry_idx - lookback_bars)
+    window = lo[start : entry_idx + 1]
+    if len(window) == 0:
+        return float(channel_lower)
+    swing_low = float(window.min())
+    # Don't let the stop fall below the channel floor (that's the hard invalidation).
+    if channel_lower > 0:
+        swing_low = max(swing_low, channel_lower)
+    return swing_low
+
+
 @dataclass
 class ExitConfig:
     target_mode: str = "vah"
