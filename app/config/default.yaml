@@ -34,6 +34,7 @@ detector:
   min_range_days: 45          # accumulation must last >= 45 days
   max_range_days: 180
   scan_step_days: 3
+  window_step_days: 10
   # channel: range moves up to ~50% over the window
   max_channel_width: 0.50     # high/low spread as fraction of low
   # trend classification: sideways -> flat bounds, downtrend -> sloped bounds
