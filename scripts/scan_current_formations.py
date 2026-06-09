@@ -30,6 +30,7 @@ FRESH_DAYS = 75          # keep formations still active now. The detector finds 
                          # We additionally require price is still inside/at the channel
                          # (not collapsed far below the lower bound) — see filter below.
 MAX_BELOW_LOWER = 0.15   # drop if last close fell >15% under the lower bound (channel dead)
+ALREADY_PUMPED_PCT = 0.08  # drop if price already flew >8% past the border (pump gone)
 MIN_BARS = CFG["detector"]["min_range_days"]
 NOW_MS = int(time.time() * 1000)
 LOOKBACK_DAYS = 400
@@ -104,8 +105,11 @@ def scan():
             # Channel must still be alive: price not collapsed far below the floor.
             if lb > 0 and last_close < lb * (1 - MAX_BELOW_LOWER):
                 continue
+            dist_pct = (ub / last_close - 1) * 100
+            if last_close > ub * (1 + ALREADY_PUMPED_PCT):
+                continue  # price already flew >8% past the border = pump gone, not a fresh entry
             if last_close > ub:
-                state = "broke_out"
+                state = "broke_out"          # just closed above the border = entry candidate
             elif last_close >= ub * (1 - NEAR_PCT):
                 state = "near_upper"
             else:
@@ -128,7 +132,17 @@ def scan():
         if (i + 1) % 50 == 0:
             print(f"  {i+1}/{len(syms)} scanned, {len(results)} formations so far", flush=True)
         time.sleep(0.08)
-    return results, len(syms)
+    # Dedup to ONE row per symbol: prefer the most actionable state
+    # (broke_out > near_upper > accumulating), then highest score, then narrowest channel.
+    state_rank = {"broke_out": 0, "near_upper": 1, "accumulating": 2}
+    best = {}
+    for r in results:
+        s = r["symbol"]
+        key = (state_rank[r["state"]], -r["score"], r["channel_width"])
+        if s not in best or key < best[s][0]:
+            best[s] = (key, r)
+    deduped = [v[1] for v in best.values()]
+    return deduped, len(syms)
 
 
 def fmt_price(x):
