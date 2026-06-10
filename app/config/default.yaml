@@ -37,9 +37,19 @@ detector:
   window_step_days: 10
   # channel: range moves up to ~50% over the window
   max_channel_width: 0.50     # high/low spread as fraction of low
-  # trend classification: sideways -> flat bounds, downtrend -> sloped bounds
+  # trend classification: sideways -> flat bounds, downtrend -> sloped bounds,
+  # uptrend -> EXCLUDED (a rising market is markup, not accumulation)
   downtrend_slope_threshold: -0.0005   # normalized close slope below this => downtrend
+  uptrend_slope_threshold: 0.0010      # normalized close slope above this => uptrend (rejected)
   flat_bound_quantile: 0.0    # 0 => use absolute max-high / min-low for flat channel
+  # ── method guards (calibrated on Никита's 2026-06-10 formation review) ──
+  touch_tol: 0.02             # bar within 2% of a bound counts as a "touch"
+  min_bound_touches: 2        # each bound must be tested >=2x (else "висит в воздухе")
+  max_intra_window_run_up: 0.30  # reject if a completed rally >30% already happened inside the window (pump gone)
+  breakdown_consec_closes: 3  # >=3 consecutive daily closes below the floor => channel broken down (dead)
+  breakdown_tol: 0.0          # extra slack below the lower bound before counting a breakdown close
+  tail_trend_bars: 10         # bars at the end of the window used for the tail-trend check
+  tail_downtrend_slope: -0.005   # if a SIDEWAYS window's last N bars slope below this => collapsing now (dead)
   # spark: green candle whose volume exceeds EACH of up-to-4 preceding reds individually
   spark:
     max_red_lookback: 4

@@ -121,25 +121,48 @@ def detect_sparks_and_twix(
 
 @dataclass
 class ChannelResult:
-    trend: str  # "sideways" | "downtrend"
+    trend: str  # "sideways" | "downtrend" | "uptrend"
     upper_bound: float  # bound at the last bar
     lower_bound: float  # bound at the last bar
     upper_line: np.ndarray  # per-bar upper bound
     lower_line: np.ndarray  # per-bar lower bound
     channel_width: float  # (max_high - min_low) / min_low
     slope_norm: float  # close slope normalised by mean price
+    upper_touches: int = 0  # how many bars touch the upper bound (real resistance)
+    lower_touches: int = 0  # how many bars touch the lower bound (real support)
+
+
+def _count_touches(values: np.ndarray, level: np.ndarray, tol: float) -> int:
+    """Count bars whose value comes within ``tol`` (fraction) of the level line.
+
+    A real channel border is one that price tested MORE THAN ONCE. A border
+    that is a single wick spike (touched once, then never revisited) is "висит
+    в воздухе" — not a tradable support/resistance.
+    """
+    ref = np.maximum(np.abs(level), EPS)
+    return int(np.sum(np.abs(values - level) / ref <= tol))
 
 
 def build_channel(
     w: pd.DataFrame,
     downtrend_slope_threshold: float = -0.0005,
+    uptrend_slope_threshold: float = 0.0010,
+    touch_tol: float = 0.02,
 ) -> ChannelResult:
     """Classify the window trend and build the channel bounds.
 
+    Trend (by normalised close slope):
+      * slope <= downtrend_slope_threshold (< 0)  -> "downtrend" (sloped bounds)
+      * slope >= uptrend_slope_threshold   (> 0)  -> "uptrend"   (EXCLUDED — a
+        rising market is not accumulation; the operator is already marking up)
+      * otherwise                                 -> "sideways"  (flat bounds)
+
     Sideways  -> FLAT bounds at absolute max-high / min-low of the window.
-    Downtrend -> SLOPED bounds: linear regression of close, with upper/lower
-                 offset to the extreme high/low residuals so the channel hugs
-                 the actual price envelope.
+    Downtrend/Uptrend -> SLOPED bounds: linear regression of close, with
+                 upper/lower offset to the extreme high/low residuals.
+
+    Also counts how many bars TOUCH each bound (within ``touch_tol``) so callers
+    can reject "hanging" channels whose border was a single wick.
     """
     close = w["close"].to_numpy(dtype=float)
     high = w["high"].to_numpy(dtype=float)
@@ -162,10 +185,22 @@ def build_channel(
         lower_off = float(np.min(low - trend_line))
         upper_line = trend_line + upper_off
         lower_line = trend_line + lower_off
+    elif slope_norm >= uptrend_slope_threshold:
+        # Rising market — NOT accumulation. Bounds still computed for diagnostics,
+        # but detect_accumulations will reject this trend outright.
+        trend = "uptrend"
+        trend_line = slope * x + intercept
+        upper_off = float(np.max(high - trend_line))
+        lower_off = float(np.min(low - trend_line))
+        upper_line = trend_line + upper_off
+        lower_line = trend_line + lower_off
     else:
         trend = "sideways"
         upper_line = np.full(n, max_high, dtype=float)
         lower_line = np.full(n, min_low, dtype=float)
+
+    upper_touches = _count_touches(high, upper_line, touch_tol)
+    lower_touches = _count_touches(low, lower_line, touch_tol)
 
     return ChannelResult(
         trend=trend,
@@ -175,6 +210,8 @@ def build_channel(
         lower_line=lower_line,
         channel_width=float(channel_width),
         slope_norm=slope_norm,
+        upper_touches=upper_touches,
+        lower_touches=lower_touches,
     )
 
 
@@ -250,6 +287,50 @@ class MethodicDetector:
         ch = build_channel(pre, downtrend_slope_threshold=float(self.detector_cfg.get("downtrend_slope_threshold", -0.0005)))
         return ch.trend == "downtrend"
 
+    def _max_run_up_pct(self, w: pd.DataFrame) -> float:
+        """Largest sustained up-move INSIDE the accumulation window.
+
+        A genuine accumulation range only has small, single anomalous green
+        candles that DON'T move price much. If a multi-bar rally already lifted
+        price by a large fraction inside the window, the pump has already
+        happened (INUSDT 15-Apr, LPTUSDT +37% 10-Apr, ALTUSDT +50% 22-May) — the
+        big player has booked profit and there is nothing left to ride. We scan
+        every bar pair (i<j) for the max close-to-close gain over a bounded span.
+        """
+        close = w["close"].to_numpy(dtype=float)
+        n = len(close)
+        if n < 2:
+            return 0.0
+        # running min of close up to each bar -> max gain from any earlier trough
+        run_min = np.minimum.accumulate(close)
+        gains = close / np.maximum(run_min, EPS) - 1.0
+        return float(np.max(gains))
+
+    def _broke_down_at_end(
+        self, w: pd.DataFrame, lower_line: np.ndarray, tol: float, consec: int
+    ) -> bool:
+        """Did the channel break DOWN near the end of the window?
+
+        Per TZ a single prick below the border that the operator returns is OK,
+        but ``consec`` consecutive daily CLOSES below the lower bound = the floor
+        is lost, the range is broken, the formation is dead (LTC 2-Jun, ATOM
+        27-May, EGLD 2-Jun, MNT -24% 1-6-Jun, COTI late-May).
+        """
+        close = w["close"].to_numpy(dtype=float)
+        n = len(close)
+        if n == 0 or consec <= 0:
+            return False
+        floor = lower_line * (1.0 - tol)
+        below = close < floor
+        # count trailing consecutive closes below the floor
+        run = 0
+        for k in range(n - 1, -1, -1):
+            if below[k]:
+                run += 1
+            else:
+                break
+        return run >= consec
+
     def _window_metrics(self, w: pd.DataFrame, marks: dict[str, np.ndarray], start_idx: int, end_idx: int, df: pd.DataFrame | None = None) -> dict[str, Any]:
         cfg = self.detector_cfg
         spark_weight = float(cfg.get("spark_weight", 1.0))
@@ -258,6 +339,8 @@ class MethodicDetector:
         channel = build_channel(
             w,
             downtrend_slope_threshold=float(cfg.get("downtrend_slope_threshold", -0.0005)),
+            uptrend_slope_threshold=float(cfg.get("uptrend_slope_threshold", 0.0010)),
+            touch_tol=float(cfg.get("touch_tol", 0.02)),
         )
 
         # Count marks within [start_idx, end_idx] via cumulative sums (O(1)).
@@ -273,17 +356,45 @@ class MethodicDetector:
 
         prior_high = float(w["high"].iloc[0])
 
+        # NEW guards (TZ canon, calibrated on Никита's 2026-06-10 review):
+        #  - max_run_up: a completed pump already inside the window?
+        #  - broke_down: the floor already lost at the window end?
+        #  - tail_downtrend: is the recent tail of the window itself collapsing
+        #    (a range that's breaking DOWN right now, even if the greedy wide
+        #    bounds swallowed the dump — GLM 03-27→today w=0.48)?
+        max_run_up = self._max_run_up_pct(w)
+        broke_down = self._broke_down_at_end(
+            w,
+            channel.lower_line,
+            tol=float(cfg.get("breakdown_tol", 0.0)),
+            consec=int(cfg.get("breakdown_consec_closes", 3)),
+        )
+        tail_n = int(cfg.get("tail_trend_bars", 10))
+        tail_downtrend = False
+        if len(w) >= tail_n:
+            tail_ch = build_channel(
+                w.iloc[-tail_n:],
+                downtrend_slope_threshold=float(cfg.get("tail_downtrend_slope", -0.005)),
+                uptrend_slope_threshold=float(cfg.get("uptrend_slope_threshold", 0.0010)),
+            )
+            tail_downtrend = tail_ch.trend == "downtrend"
+
         return {
             "trend": channel.trend,
             "upper_bound": channel.upper_bound,
             "lower_bound": channel.lower_bound,
             "channel_width": channel.channel_width,
             "slope_norm": channel.slope_norm,
+            "upper_touches": channel.upper_touches,
+            "lower_touches": channel.lower_touches,
             "spark_count": spark_count,
             "twix_count": twix_count,
             "accumulation_score": float(score),
             "downtrend_to_range": bool(downtrend_to_range),
             "prior_high": prior_high,
+            "max_run_up_pct": float(max_run_up),
+            "broke_down_at_end": bool(broke_down),
+            "tail_downtrend": bool(tail_downtrend),
             "n_bars": int(len(w)),
         }
 
@@ -324,12 +435,34 @@ class MethodicDetector:
                 # Range constraint: up to ~50% (channel_width <= max_width).
                 if m["channel_width"] > max_width:
                     continue
-                # Must be sideways or downtrend (uptrend excluded by construction:
-                # sideways uses flat bounds; downtrend has negative slope).
+                # Trend must be sideways or downtrend. An UPTREND is markup, not
+                # accumulation — exclude it (ATOM, COTI, ARKM were rising/broke up).
                 if m["trend"] not in ("sideways", "downtrend"):
                     continue
                 # Accumulation score threshold (manipulation likely at >= 3).
                 if m["accumulation_score"] < min_score:
+                    continue
+                # GUARD 1 — already pumped: a completed rally inside the window
+                # means the move is gone (INUSDT, LPTUSDT, ALTUSDT, FOLKS, PUNDIX).
+                max_run_up_limit = float(cfg.get("max_intra_window_run_up", 0.30))
+                if m["max_run_up_pct"] > max_run_up_limit:
+                    continue
+                # GUARD 2 — channel broken DOWN at the end: floor lost, dead
+                # formation (LTC, ATOM, EGLD, MNT, COTI, GLM).
+                if m["broke_down_at_end"]:
+                    continue
+                # GUARD 2b — a recent tail that is itself STEEPLY downtrending
+                # means the range is collapsing right now (markdown, not
+                # accumulation). The steep tail threshold (tail_downtrend_slope,
+                # ~10x the gentle formation downtrend threshold) lets a genuine
+                # slow downtrend accumulation pass while killing freefalls — GLM
+                # w=0.48 (tail slope -0.027), EGLD/COTI dumps.
+                if m.get("tail_downtrend"):
+                    continue
+                # GUARD 3 — bounds must be REAL (tested more than once), not a
+                # single wick "hanging in the air" (PUNDIX, EGLD floor 3.61).
+                min_touches = int(cfg.get("min_bound_touches", 2))
+                if m["lower_touches"] < min_touches or m["upper_touches"] < min_touches:
                     continue
 
                 case_id = f"{symbol}_{w['timestamp'].iloc[0].date()}_{w['timestamp'].iloc[-1].date()}"

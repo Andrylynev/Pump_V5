@@ -158,3 +158,83 @@ def test_channel_width_is_range_fraction():
     ch = build_channel(_mk(rows))
     # max_high=150, min_low=100 -> width = 50/100 = 0.5
     assert abs(ch.channel_width - 0.5) < 1e-6
+
+
+# ──────────────── METHOD GUARDS (Никита 2026-06-10 review) ────────────────
+
+from app.detectors.methodic_detector import MethodicDetector
+
+_DET_CFG = {
+    "min_range_days": 45, "max_range_days": 180, "scan_step_days": 3,
+    "window_step_days": 10, "max_channel_width": 0.50,
+    "downtrend_slope_threshold": -0.0005, "uptrend_slope_threshold": 0.0010,
+    "touch_tol": 0.02, "min_bound_touches": 2,
+    "max_intra_window_run_up": 0.30, "breakdown_consec_closes": 3, "breakdown_tol": 0.0,
+    "tail_trend_bars": 10, "tail_downtrend_slope": -0.005,
+    "spark": {"max_red_lookback": 4, "small_body_max_ratio": 0.35},
+    "spark_weight": 1.0, "twix_weight": 0.5, "min_accumulation_score": 3.0,
+    "downtrend_to_range_bonus": False, "downtrend_lookback_days": 30,
+}
+
+
+def test_channel_uptrend_classified_and_excluded():
+    # Clear rising market -> "uptrend", which the detector must NOT treat as
+    # accumulation (ATOM/COTI/ARKM were rising / broke up, not ranging).
+    closes = np.linspace(100, 200, 60)
+    rows = [(c, c + 2, c - 2, c, 100.0) for c in closes]
+    ch = build_channel(_mk(rows), uptrend_slope_threshold=0.0010)
+    assert ch.trend == "uptrend"
+    assert ch.slope_norm > 0
+
+
+def test_count_touches_rejects_single_wick():
+    # 59 flat bars near 100, ONE spike low to 50 (a wick that's never revisited).
+    rows = [(100, 102, 99, 100, 100.0) for _ in range(59)]
+    rows.insert(30, (100, 102, 50, 100, 100.0))  # single deep wick
+    ch = build_channel(_mk(rows))
+    # min_low=50 was touched exactly once -> lower border "hangs in the air".
+    assert ch.lower_touches == 1
+
+
+def test_max_run_up_detects_completed_pump():
+    det = MethodicDetector(detector_cfg=_DET_CFG)
+    # flat ~100 then a +40% rally inside the window
+    closes = [100.0] * 30 + list(np.linspace(100, 140, 20))
+    w = _mk([(c, c + 1, c - 1, c, 100.0) for c in closes])
+    assert det._max_run_up_pct(w) > 0.30
+
+
+def test_broke_down_at_end_three_closes_below_floor():
+    det = MethodicDetector(detector_cfg=_DET_CFG)
+    n = 50
+    lower_line = np.full(n, 100.0)
+    closes = [105.0] * 47 + [98.0, 97.0, 96.0]  # 3 closes below the 100 floor
+    w = _mk([(c, c + 1, c - 1, c, 100.0) for c in closes])
+    assert det._broke_down_at_end(w, lower_line, tol=0.0, consec=3) is True
+    # a single prick (1 close below) must NOT count as a breakdown
+    closes2 = [105.0] * 49 + [98.0]
+    w2 = _mk([(c, c + 1, c - 1, c, 100.0) for c in closes2])
+    assert det._broke_down_at_end(w2, lower_line, tol=0.0, consec=3) is False
+
+
+def test_detect_rejects_broken_down_channel():
+    # A valid scoring range that then loses its floor with 3 closes below at the
+    # end must NOT be returned as a live formation.
+    det = MethodicDetector(detector_cfg=_DET_CFG)
+    rng = np.random.default_rng(1)
+    base = 100 + rng.normal(0, 1.5, 47)
+    rows = []
+    # seed enough sparks: red runs then anomalous green
+    for k, c in enumerate(base):
+        if k % 8 == 0 and k >= 3:
+            rows.append((c, c + 0.3, c - 0.3, c + 0.2, 500.0))  # green small-body high-vol
+        elif k % 8 in (1, 2, 3):
+            rows.append((c, c + 1, c - 2, c - 1.5, 50.0))       # red low-vol
+        else:
+            rows.append((c, c + 1, c - 1, c, 100.0))
+    rows += [(95, 96, 90, 92, 100.0), (92, 93, 88, 89, 100.0), (89, 90, 85, 86, 100.0)]
+    df = _mk(rows)
+    forms = det.detect_accumulations("TESTBROKE", df)
+    # Either no formation, or none whose window ends in the broken-down tail.
+    for f in forms:
+        assert not f.diagnostics.get("broke_down_at_end", False)

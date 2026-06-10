@@ -31,6 +31,7 @@ FRESH_DAYS = 75          # keep formations still active now. The detector finds 
                          # (not collapsed far below the lower bound) — see filter below.
 MAX_BELOW_LOWER = 0.15   # drop if last close fell >15% under the lower bound (channel dead)
 ALREADY_PUMPED_PCT = 0.08  # drop if price already flew >8% past the border (pump gone)
+BREAKDOWN_CONSEC = 3     # >=3 consecutive trailing closes below the floor (post-window) = dead
 MIN_BARS = CFG["detector"]["min_range_days"]
 NOW_MS = int(time.time() * 1000)
 LOOKBACK_DAYS = 400
@@ -102,9 +103,40 @@ def scan():
             if age_days > FRESH_DAYS:
                 continue  # stale formation, not current
             ub = float(f.upper_bound); lb = float(f.lower_bound)
-            # Channel must still be alive: price not collapsed far below the floor.
+
+            # ── POST-WINDOW LIVENESS (Никита 2026-06-10 review) ──
+            # The detector window ends at acc_end; the channel can die AFTER that.
+            # Look at the bars between acc_end and now to decide if it's still live.
+            post = df[df["timestamp"] > acc_end]
+            post_close = post["close"].to_numpy(dtype=float)
+            post_high = post["high"].to_numpy(dtype=float)
+
+            # DEAD if the floor was lost: >=3 consecutive TRAILING closes below lb.
+            if lb > 0 and len(post_close) >= BREAKDOWN_CONSEC:
+                below = post_close < lb
+                trail = 0
+                for k in range(len(below) - 1, -1, -1):
+                    if below[k]:
+                        trail += 1
+                    else:
+                        break
+                if trail >= BREAKDOWN_CONSEC:
+                    continue  # channel broken DOWN (LTC, EGLD, COTI, PUNDIX, MNT, GLM...)
+            # DEAD if the latest close is already sitting below the floor (the
+            # range is lost right now even if the trailing run is short).
+            if lb > 0 and last_close < lb:
+                continue
+            # DEAD if collapsed far below the floor right now (hard backstop).
             if lb > 0 and last_close < lb * (1 - MAX_BELOW_LOWER):
                 continue
+
+            # ALREADY PUMPED if, after the window, price (by HIGH — a pump spikes
+            # the wick, not just the close) ran far above the top and the move is
+            # gone (INUSDT 2nd pump, FOLKS, ALT +50%, MANTA, ATOM pop-and-fade).
+            if len(post_high) and ub > 0:
+                if float(post_high.max()) > ub * (1 + ALREADY_PUMPED_PCT):
+                    continue  # the breakout/pump already happened post-window
+
             dist_pct = (ub / last_close - 1) * 100
             if last_close > ub * (1 + ALREADY_PUMPED_PCT):
                 continue  # price already flew >8% past the border = pump gone, not a fresh entry
