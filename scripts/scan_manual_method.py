@@ -133,6 +133,34 @@ def analyze(symbol, df):
     slope = np.polyfit(x, y, 1)[0] / max(np.mean(y), 1e-12)
     trend = "downtrend" if slope < -0.0005 else "sideways"
     upper = hi
+
+    # ── LIVENESS GUARDS (parity with the V5 code scan, Никита 2026-06-10) ──
+    # The manual window ends today, so the "break-down" / "already-pumped" tests
+    # look at the tail of the window itself.
+    c_arr = w["close"].to_numpy(); h_arr = w["high"].to_numpy()
+    # DEAD: >=3 consecutive trailing closes below the floor.
+    below = c_arr < lo; trail = 0
+    for k in range(len(below) - 1, -1, -1):
+        if below[k]:
+            trail += 1
+        else:
+            break
+    if trail >= 3:
+        return None
+    # DEAD: latest close already below the floor (no entry below the channel).
+    if last_close < lo:
+        return None
+    # DEAD: a steeply downtrending tail = collapsing right now (10-bar slope).
+    if len(w) >= 10:
+        ty = w["close"].to_numpy()[-10:]; tx = np.arange(10)
+        tslope = np.polyfit(tx, ty, 1)[0] / max(np.mean(ty), 1e-12)
+        if tslope < -0.005:
+            return None
+    # ALREADY PUMPED: price (by high) already flew >8% past the top => move gone.
+    if upper > 0 and float(h_arr.max()) > upper * (1 + 0.08) and last_close < upper:
+        # spike above top then fell back inside => the pump already happened
+        return None
+
     if last_close > upper:
         state = "broke_out"
     elif last_close >= upper * (1 - NEAR_PCT):
